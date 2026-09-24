@@ -1,1 +1,713 @@
 name: Netlify Deploy
+
+on:
+  workflow_call:
+    inputs:
+      # ── What to deploy ──────────────────────────────────────────────────────
+      publish-dir:
+        description: "Directory to deploy, relative to working-directory"
+        required: false
+        default: "dist"
+        type: string
+      functions-dir:
+        description: "Netlify Functions directory, relative to working-directory (leave empty to skip)"
+        required: false
+        default: ""
+        type: string
+      working-directory:
+        description: "Directory to install, build and deploy from (useful for monorepos)"
+        required: false
+        default: "."
+        type: string
+      artifact-name:
+        description: "Name of an artifact from the same workflow run to deploy instead of building (downloaded into publish-dir)"
+        required: false
+        default: ""
+        type: string
+
+      # ── Where to deploy ─────────────────────────────────────────────────────
+      site-id:
+        description: "Netlify site ID or name. Used when the NETLIFY_SITE_ID secret is not provided"
+        required: false
+        default: ""
+        type: string
+      production:
+        description: "Deploy to production: 'auto' (pushes to production-branch), 'true' or 'false'"
+        required: false
+        default: "auto"
+        type: string
+      production-branch:
+        description: "Branch treated as production when production is 'auto' (defaults to the repository default branch)"
+        required: false
+        default: ""
+        type: string
+      alias:
+        description: "Alias for preview deploys: 'auto' (pr-<number> or branch name), 'none', or a custom value"
+        required: false
+        default: "auto"
+        type: string
+      message:
+        description: "Deploy message shown in the Netlify UI (defaults to the PR title or commit message)"
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: "GitHub environment to run the deploy job in (enables environment secrets and protection rules)"
+        required: false
+        default: ""
+        type: string
+
+      # ── How to build ────────────────────────────────────────────────────────
+      node-version:
+        description: "Node version to use. 'auto' reads .nvmrc / .node-version, falling back to the latest LTS"
+        required: false
+        default: "auto"
+        type: string
+      package-manager:
+        description: "Package manager: 'auto' (detected from packageManager field or lockfile), 'npm', 'pnpm', 'yarn' or 'bun'"
+        required: false
+        default: "auto"
+        type: string
+      install-command:
+        description: "Command to install dependencies. 'auto' uses the detected package manager, 'none' skips it"
+        required: false
+        default: "auto"
+        type: string
+      build-command:
+        description: "Command to build the site. 'auto' runs the package.json build script if present, 'none' skips it"
+        required: false
+        default: "auto"
+        type: string
+      netlify-build:
+        description: "Let the Netlify CLI run the build (netlify.toml, build plugins) instead of build-command"
+        required: false
+        default: "false"
+        type: string
+      env:
+        description: "Extra build-time environment variables, one KEY=VALUE per line (non-secret)"
+        required: false
+        default: ""
+        type: string
+      cache:
+        description: "Cache package manager downloads between runs"
+        required: false
+        default: "true"
+        type: string
+
+      # ── Netlify CLI ─────────────────────────────────────────────────────────
+      netlify-cli-version:
+        description: "Version of netlify-cli to install"
+        required: false
+        default: "latest"
+        type: string
+      filter:
+        description: "Monorepo package to deploy (passed to netlify deploy --filter)"
+        required: false
+        default: ""
+        type: string
+      deploy-args:
+        description: "Extra arguments appended to the netlify deploy command"
+        required: false
+        default: ""
+        type: string
+
+      # ── Reporting ───────────────────────────────────────────────────────────
+      comment-on-pr:
+        description: "Post/update a sticky PR comment with the preview URL (and failures)"
+        required: false
+        default: "true"
+        type: string
+      deployment-name:
+        description: "Label used in comments and summaries. Use a unique value per site when deploying several sites from one PR"
+        required: false
+        default: "Netlify"
+        type: string
+
+      # ── Runner & checkout ───────────────────────────────────────────────────
+      runs-on:
+        description: "Runner label to use"
+        required: false
+        default: "ubuntu-latest"
+        type: string
+      timeout-minutes:
+        description: "Job timeout in minutes"
+        required: false
+        default: 30
+        type: number
+      ref:
+        description: "Git ref to check out (defaults to the ref that triggered the workflow)"
+        required: false
+        default: ""
+        type: string
+      submodules:
+        description: "Check out submodules: 'false', 'true' or 'recursive'"
+        required: false
+        default: "false"
+        type: string
+
+    secrets:
+      NETLIFY_AUTH_TOKEN:
+        description: "Netlify personal access token"
+        required: false
+      NETLIFY_SITE_ID:
+        description: "Netlify site ID (API ID from Site configuration → General)"
+        required: false
+      BUILD_ENV:
+        description: "Secret build-time environment variables, one KEY=VALUE per line (values are masked in logs)"
+        required: false
+
+    outputs:
+      url:
+        description: "Primary URL: the production URL for production deploys, the alias/preview URL otherwise"
+        value: ${{ jobs.deploy.outputs.url }}
+      deploy-url:
+        description: "URL of this deploy as reported by Netlify"
+        value: ${{ jobs.deploy.outputs.deploy-url }}
+      permalink:
+        description: "Immutable URL unique to this deploy"
+        value: ${{ jobs.deploy.outputs.permalink }}
+      deploy-id:
+        description: "Netlify deploy ID"
+        value: ${{ jobs.deploy.outputs.deploy-id }}
+      logs-url:
+        description: "Link to the deploy in the Netlify UI"
+        value: ${{ jobs.deploy.outputs.logs-url }}
+      production:
+        description: "'true' if this was a production deploy"
+        value: ${{ jobs.deploy.outputs.production }}
+      alias:
+        description: "Alias used for the preview deploy (empty for production)"
+        value: ${{ jobs.deploy.outputs.alias }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.deployment-name }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    # One deploy per site + PR/branch at a time. Superseded preview deploys are
+    # cancelled; production deploys are queued instead of being interrupted.
+    concurrency:
+      group: netlify-deploy-${{ inputs.deployment-name }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+      deploy-url: ${{ steps.deploy.outputs.deploy-url }}
+      permalink: ${{ steps.deploy.outputs.permalink }}
+      deploy-id: ${{ steps.deploy.outputs.deploy-id }}
+      logs-url: ${{ steps.deploy.outputs.logs-url }}
+      production: ${{ steps.config.outputs.production }}
+      alias: ${{ steps.config.outputs.alias }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: ${{ inputs.submodules }}
+
+      - name: Resolve Configuration
+        id: config
+        env:
+          HAS_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN != '' }}
+          HAS_SITE_ID: ${{ secrets.NETLIFY_SITE_ID != '' || inputs.site-id != '' }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork == true }}
+          INPUT_PRODUCTION: ${{ inputs.production }}
+          INPUT_PRODUCTION_BRANCH: ${{ inputs.production-branch }}
+          INPUT_ALIAS: ${{ inputs.alias }}
+          INPUT_MESSAGE: ${{ inputs.message }}
+          INPUT_NODE_VERSION: ${{ inputs.node-version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          # ── Credentials ──────────────────────────────────────────────────
+          if [ "$HAS_TOKEN" != "true" ] || [ "$HAS_SITE_ID" != "true" ]; then
+            [ "$HAS_TOKEN" != "true" ] && echo "::error title=Missing NETLIFY_AUTH_TOKEN::Pass the NETLIFY_AUTH_TOKEN secret to this workflow (see README)."
+            [ "$HAS_SITE_ID" != "true" ] && echo "::error title=Missing site ID::Pass the NETLIFY_SITE_ID secret or the site-id input."
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::error::This pull request comes from a fork, so repository secrets are not available to it."
+            fi
+            exit 1
+          fi
+
+          # ── Production vs preview ────────────────────────────────────────
+          PRODUCTION_BRANCH="${INPUT_PRODUCTION_BRANCH:-${DEFAULT_BRANCH:-main}}"
+          case "$INPUT_PRODUCTION" in
+            true|false) PRODUCTION="$INPUT_PRODUCTION" ;;
+            auto)
+              if [ -z "$PR_NUMBER" ] && [ "$GITHUB_REF" = "refs/heads/$PRODUCTION_BRANCH" ]; then
+                PRODUCTION=true
+              else
+                PRODUCTION=false
+              fi
+              ;;
+            *) echo "::error::production must be 'auto', 'true' or 'false' (got '$INPUT_PRODUCTION')"; exit 1 ;;
+          esac
+
+          # ── Alias ────────────────────────────────────────────────────────
+          # Netlify aliases become part of a subdomain (<alias>--<site>.netlify.app),
+          # so keep them lowercase, DNS-safe and short.
+          slugify() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-37 | sed -E 's/-+$//'
+          }
+          ALIAS=""
+          if [ "$PRODUCTION" != "true" ]; then
+            case "$INPUT_ALIAS" in
+              none|"") ALIAS="" ;;
+              auto)
+                if [ -n "$PR_NUMBER" ]; then
+                  ALIAS="pr-$PR_NUMBER"
+                else
+                  ALIAS="$(slugify "$GITHUB_REF_NAME")"
+                fi
+                ;;
+              *) ALIAS="$(slugify "$INPUT_ALIAS")" ;;
+            esac
+          fi
+
+          # ── Deploy message ───────────────────────────────────────────────
+          SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+          SHORT_SHA="${SHA:0:7}"
+          if [ -n "$INPUT_MESSAGE" ]; then
+            MESSAGE="$INPUT_MESSAGE"
+          elif [ -n "$PR_NUMBER" ]; then
+            MESSAGE="PR #$PR_NUMBER: $PR_TITLE ($SHORT_SHA)"
+          elif [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+            MESSAGE="$GITHUB_REF_NAME@$SHORT_SHA: $(printf '%s\n' "$HEAD_COMMIT_MESSAGE" | head -n1)"
+          else
+            MESSAGE="$GITHUB_REF_NAME@$SHORT_SHA ($GITHUB_EVENT_NAME)"
+          fi
+          MESSAGE="$(printf '%s' "$MESSAGE" | tr '\n\r' '  ' | cut -c1-250)"
+
+          # ── Node version ─────────────────────────────────────────────────
+          NODE_VERSION=""
+          NODE_VERSION_FILE=""
+          if [ "$INPUT_NODE_VERSION" = "auto" ]; then
+            for f in .nvmrc .node-version "$GITHUB_WORKSPACE/.nvmrc" "$GITHUB_WORKSPACE/.node-version"; do
+              if [ -f "$f" ]; then
+                ABS="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+                NODE_VERSION_FILE="${ABS#"$GITHUB_WORKSPACE"/}"
+                break
+              fi
+            done
+            [ -z "$NODE_VERSION_FILE" ] && NODE_VERSION="lts/*"
+          else
+            NODE_VERSION="$INPUT_NODE_VERSION"
+          fi
+
+          {
+            echo "production=$PRODUCTION"
+            echo "alias=$ALIAS"
+            echo "message=$MESSAGE"
+            echo "sha=$SHA"
+            echo "node-version=$NODE_VERSION"
+            echo "node-version-file=$NODE_VERSION_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Production:   $PRODUCTION (production branch: $PRODUCTION_BRANCH)"
+          echo "Alias:        ${ALIAS:-<none>}"
+          echo "Message:      $MESSAGE"
+          echo "Node version: ${NODE_VERSION:-from $NODE_VERSION_FILE}"
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.config.outputs.node-version }}
+          node-version-file: ${{ steps.config.outputs.node-version-file }}
+
+      - name: Detect Package Manager & Commands
+        id: pm
+        env:
+          INPUT_PM: ${{ inputs.package-manager }}
+          INPUT_INSTALL: ${{ inputs.install-command }}
+          INPUT_BUILD: ${{ inputs.build-command }}
+          NETLIFY_BUILD: ${{ inputs.netlify-build }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          FUNCTIONS_DIR: ${{ inputs.functions-dir }}
+        run: |
+          set -euo pipefail
+
+          # Find the nearest file walking up from working-directory to the repo root.
+          find_up() {
+            local dir="$PWD"
+            while :; do
+              [ -f "$dir/$1" ] && { echo "$dir/$1"; return 0; }
+              { [ "$dir" = "$GITHUB_WORKSPACE" ] || [ "$dir" = "/" ]; } && return 1
+              dir="$(dirname "$dir")"
+            done
+          }
+
+          HAS_PACKAGE_JSON=false
+          [ -f package.json ] && HAS_PACKAGE_JSON=true
+
+          # ── Package manager ──────────────────────────────────────────────
+          # The packageManager field usually lives in the monorepo root, so keep
+          # walking up until a package.json that declares it is found.
+          PM_SPEC=""
+          DIR="$PWD"
+          while :; do
+            if [ -f "$DIR/package.json" ]; then
+              PM_SPEC="$(PKG="$DIR/package.json" node -p "require(process.env.PKG).packageManager || ''")"
+              [ -n "$PM_SPEC" ] && break
+            fi
+            { [ "$DIR" = "$GITHUB_WORKSPACE" ] || [ "$DIR" = "/" ]; } && break
+            DIR="$(dirname "$DIR")"
+          done
+
+          if [ "$INPUT_PM" != "auto" ]; then
+            PM="$INPUT_PM"
+          elif [ -n "$PM_SPEC" ]; then
+            PM="${PM_SPEC%%@*}"
+          elif find_up bun.lock >/dev/null || find_up bun.lockb >/dev/null; then
+            PM=bun
+          elif find_up pnpm-lock.yaml >/dev/null; then
+            PM=pnpm
+          elif find_up yarn.lock >/dev/null; then
+            PM=yarn
+          else
+            PM=npm
+          fi
+
+          case "$PM" in
+            npm|pnpm|yarn|bun) ;;
+            *) echo "::error::Unsupported package manager '$PM' (expected npm, pnpm, yarn or bun)"; exit 1 ;;
+          esac
+
+          # Make pnpm / yarn available (bun is installed by a dedicated step).
+          if [ "$PM" = "pnpm" ] || [ "$PM" = "yarn" ]; then
+            if [ -n "$PM_SPEC" ] && [ "${PM_SPEC%%@*}" = "$PM" ] && corepack enable 2>/dev/null; then
+              echo "Enabled $PM_SPEC via corepack"
+            elif ! command -v "$PM" >/dev/null 2>&1; then
+              echo "Installing $PM globally..."
+              SPEC="$PM"
+              [ "${PM_SPEC%%@*}" = "$PM" ] && SPEC="${PM_SPEC%%+*}"
+              npm install -g "$SPEC" --no-fund --no-audit
+            fi
+          fi
+
+          # ── Cache directory ──────────────────────────────────────────────
+          case "$PM" in
+            npm)  CACHE_DIR="$(npm config get cache)" ;;
+            pnpm) CACHE_DIR="$(pnpm store path --silent)" ;;
+            yarn)
+              if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+                CACHE_DIR="$(yarn config get cacheFolder)"
+              else
+                CACHE_DIR="$(yarn cache dir)"
+              fi
+              ;;
+            bun)  CACHE_DIR="$HOME/.bun/install/cache" ;;
+          esac
+
+          # ── Install command ──────────────────────────────────────────────
+          case "$INPUT_INSTALL" in
+            none|"") INSTALL="" ;;
+            auto)
+              if [ "$HAS_PACKAGE_JSON" != "true" ]; then
+                INSTALL=""
+              elif [ -n "$ARTIFACT_NAME" ] && [ -z "$FUNCTIONS_DIR" ] && [ "$NETLIFY_BUILD" != "true" ]; then
+                # Deploying a pre-built artifact: dependencies are not needed.
+                INSTALL=""
+              else
+                case "$PM" in
+                  npm)
+                    if find_up package-lock.json >/dev/null || find_up npm-shrinkwrap.json >/dev/null; then
+                      INSTALL="npm ci"
+                    else
+                      INSTALL="npm install"
+                    fi
+                    ;;
+                  pnpm) INSTALL="pnpm install --frozen-lockfile" ;;
+                  yarn)
+                    if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+                      INSTALL="yarn install --immutable"
+                    else
+                      INSTALL="yarn install --frozen-lockfile"
+                    fi
+                    ;;
+                  bun) INSTALL="bun install --frozen-lockfile" ;;
+                esac
+              fi
+              ;;
+            *) INSTALL="$INPUT_INSTALL" ;;
+          esac
+
+          # ── Build command ────────────────────────────────────────────────
+          if [ -n "$ARTIFACT_NAME" ] || [ "$NETLIFY_BUILD" = "true" ]; then
+            BUILD=""
+          else
+            case "$INPUT_BUILD" in
+              none|"") BUILD="" ;;
+              auto)
+                if [ "$HAS_PACKAGE_JSON" = "true" ] && [ "$(node -p "Boolean(require(process.cwd() + '/package.json').scripts?.build)")" = "true" ]; then
+                  BUILD="$PM run build"
+                else
+                  BUILD=""
+                  echo "::notice::No build script found in package.json, deploying publish-dir as-is."
+                fi
+                ;;
+              *) BUILD="$INPUT_BUILD" ;;
+            esac
+          fi
+
+          {
+            echo "name=$PM"
+            echo "cache-dir=$CACHE_DIR"
+            echo "install=$INSTALL"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Package manager: $PM${PM_SPEC:+ ($PM_SPEC)}"
+          echo "Install:         ${INSTALL:-<skipped>}"
+          echo "Build:           ${BUILD:-<skipped>}"
+
+      - name: Setup Bun
+        if: ${{ steps.pm.outputs.name == 'bun' }}
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache Dependencies
+        if: ${{ inputs.cache == 'true' && steps.pm.outputs.install != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pm.outputs.cache-dir }}
+          key: ${{ runner.os }}-${{ steps.pm.outputs.name }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.pm.outputs.name }}-
+
+      - name: Load Build Environment
+        env:
+          PLAIN_ENV: ${{ inputs.env }}
+          SECRET_ENV: ${{ secrets.BUILD_ENV }}
+        run: |
+          set -euo pipefail
+
+          # Parse KEY=VALUE lines and export them to subsequent steps.
+          load_env() {
+            local source="$1" mask="$2" content="$3" line key value delim
+            [ -z "$content" ] && return 0
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+              line="${line#export }"
+              if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                echo "::error::Invalid line in $source (expected KEY=VALUE)"
+                exit 1
+              fi
+              key="${BASH_REMATCH[1]}"
+              value="${BASH_REMATCH[2]}"
+              # Strip one pair of matching surrounding quotes.
+              if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+                value="${BASH_REMATCH[1]}"
+              fi
+              if [ "$mask" = "true" ] && [ -n "$value" ]; then
+                echo "::add-mask::$value"
+              fi
+              delim="EOF_$(openssl rand -hex 8)"
+              printf '%s<<%s\n%s\n%s\n' "$key" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+              echo "Loaded $key from $source"
+            done <<< "$content"
+          }
+
+          load_env "env input" false "$PLAIN_ENV"
+          load_env "BUILD_ENV secret" true "$SECRET_ENV"
+
+      - name: Install Dependencies
+        if: ${{ steps.pm.outputs.install != '' }}
+        env:
+          INSTALL_COMMAND: ${{ steps.pm.outputs.install }}
+        run: bash -c "$INSTALL_COMMAND"
+
+      - name: Build
+        if: ${{ steps.pm.outputs.build != '' }}
+        env:
+          BUILD_COMMAND: ${{ steps.pm.outputs.build }}
+        run: bash -c "$BUILD_COMMAND"
+
+      - name: Download Build Artifact
+        if: ${{ inputs.artifact-name != '' }}
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.publish-dir }}
+
+      - name: Verify Publish Directory
+        if: ${{ inputs.netlify-build != 'true' }}
+        env:
+          PUBLISH_DIR: ${{ inputs.publish-dir }}
+        run: |
+          if [ ! -d "$PUBLISH_DIR" ]; then
+            echo "::error title=Publish directory not found::'$PUBLISH_DIR' does not exist in '$PWD'. Check the publish-dir / build-command inputs."
+            exit 1
+          fi
+          if [ -z "$(ls -A "$PUBLISH_DIR")" ]; then
+            echo "::error title=Publish directory is empty::'$PUBLISH_DIR' contains no files."
+            exit 1
+          fi
+          echo "Deploying $(find "$PUBLISH_DIR" -type f | wc -l | tr -d ' ') files from $PUBLISH_DIR"
+
+      - name: Install Netlify CLI
+        env:
+          CLI_VERSION: ${{ inputs.netlify-cli-version }}
+        run: |
+          npm install -g "netlify-cli@$CLI_VERSION" --no-fund --no-audit
+          netlify --version
+
+      - name: Deploy
+        id: deploy
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          SITE_ID: ${{ secrets.NETLIFY_SITE_ID || inputs.site-id }}
+          PUBLISH_DIR: ${{ inputs.publish-dir }}
+          FUNCTIONS_DIR: ${{ inputs.functions-dir }}
+          NETLIFY_BUILD: ${{ inputs.netlify-build }}
+          FILTER: ${{ inputs.filter }}
+          DEPLOY_ARGS: ${{ inputs.deploy-args }}
+          PRODUCTION: ${{ steps.config.outputs.production }}
+          ALIAS: ${{ steps.config.outputs.alias }}
+          MESSAGE: ${{ steps.config.outputs.message }}
+        run: |
+          set -euo pipefail
+
+          args=(deploy --dir "$PUBLISH_DIR" --site "$SITE_ID" --message "$MESSAGE" --json)
+          [ -n "$FUNCTIONS_DIR" ] && args+=(--functions "$FUNCTIONS_DIR")
+          [ -n "$FILTER" ] && args+=(--filter "$FILTER")
+
+          if [ "$PRODUCTION" = "true" ]; then
+            args+=(--prod)
+          elif [ -n "$ALIAS" ]; then
+            args+=(--alias "$ALIAS")
+          fi
+
+          # Newer CLI versions build by default on deploy; older ones need --build.
+          if [ "$NETLIFY_BUILD" = "true" ]; then
+            args+=(--build)
+          elif netlify deploy --help 2>/dev/null | grep -q -- '--no-build'; then
+            args+=(--no-build)
+          fi
+
+          if [ -n "$DEPLOY_ARGS" ]; then
+            read -r -a extra <<< "$DEPLOY_ARGS"
+            args+=("${extra[@]}")
+          fi
+
+          OUT="$RUNNER_TEMP/netlify-deploy.json"
+          echo "::group::netlify ${args[*]}"
+          netlify "${args[@]}" > "$OUT"
+          echo "::endgroup::"
+
+          # Extract the JSON object in case the CLI printed anything else to stdout.
+          JSON="$(sed -n '/^{/,/^}/p' "$OUT")"
+          if ! echo "$JSON" | jq -e . >/dev/null 2>&1; then
+            echo "::error::Could not parse Netlify CLI output:"
+            cat "$OUT"
+            exit 1
+          fi
+
+          DEPLOY_ID="$(echo "$JSON" | jq -r '.deploy_id // empty')"
+          DEPLOY_URL="$(echo "$JSON" | jq -r '.deploy_url // empty')"
+          SITE_URL="$(echo "$JSON" | jq -r '.url // empty')"
+          SITE_NAME="$(echo "$JSON" | jq -r '.site_name // empty')"
+          LOGS_URL="$(echo "$JSON" | jq -r '.logs // empty')"
+
+          if [ "$PRODUCTION" = "true" ]; then
+            URL="${SITE_URL:-$DEPLOY_URL}"
+          else
+            URL="$DEPLOY_URL"
+          fi
+          PERMALINK=""
+          if [ -n "$DEPLOY_ID" ] && [ -n "$SITE_NAME" ]; then
+            PERMALINK="https://$DEPLOY_ID--$SITE_NAME.netlify.app"
+          fi
+
+          {
+            echo "url=$URL"
+            echo "deploy-url=$DEPLOY_URL"
+            echo "permalink=$PERMALINK"
+            echo "deploy-id=$DEPLOY_ID"
+            echo "logs-url=$LOGS_URL"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=Deployed to Netlify::$URL"
+
+      - name: Write Job Summary
+        if: ${{ always() && steps.deploy.outcome == 'success' }}
+        env:
+          NAME: ${{ inputs.deployment-name }}
+          PRODUCTION: ${{ steps.config.outputs.production }}
+          URL: ${{ steps.deploy.outputs.url }}
+          PERMALINK: ${{ steps.deploy.outputs.permalink }}
+          LOGS_URL: ${{ steps.deploy.outputs.logs-url }}
+          SHA: ${{ steps.config.outputs.sha }}
+        run: |
+          if [ "$PRODUCTION" = "true" ]; then KIND="🚀 Production"; else KIND="🔍 Preview"; fi
+          {
+            echo "### $KIND deploy to $NAME"
+            echo ""
+            echo "| | |"
+            echo "| :-- | :-- |"
+            echo "| **URL** | $URL |"
+            [ -n "$PERMALINK" ] && echo "| **Permalink** | $PERMALINK |"
+            [ -n "$LOGS_URL" ] && echo "| **Deploy log** | $LOGS_URL |"
+            echo "| **Commit** | \`${SHA:0:7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare PR Comment
+        id: comment
+        if: ${{ always() && github.event.pull_request.number && inputs.comment-on-pr == 'true' && steps.config.outcome == 'success' }}
+        env:
+          NAME: ${{ inputs.deployment-name }}
+          OUTCOME: ${{ steps.deploy.outcome }}
+          PRODUCTION: ${{ steps.config.outputs.production }}
+          URL: ${{ steps.deploy.outputs.url }}
+          PERMALINK: ${{ steps.deploy.outputs.permalink }}
+          LOGS_URL: ${{ steps.deploy.outputs.logs-url }}
+          SHA: ${{ steps.config.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "body<<EOF_COMMENT"
+            if [ "$OUTCOME" = "success" ]; then
+              if [ "$PRODUCTION" = "true" ]; then
+                echo "### 🚀 $NAME production deploy is live"
+              else
+                echo "### 🔍 $NAME deploy preview is ready"
+              fi
+              echo ""
+              echo "| | |"
+              echo "| :-- | :-- |"
+              echo "| **Preview** | $URL |"
+              [ -n "$PERMALINK" ] && echo "| **Permalink** | $PERMALINK |"
+              [ -n "$LOGS_URL" ] && echo "| **Deploy log** | [Netlify]($LOGS_URL) |"
+              echo "| **Commit** | \`${SHA:0:7}\` |"
+            else
+              echo "### ❌ $NAME deploy failed"
+              echo ""
+              echo "The deploy for commit \`${SHA:0:7}\` did not complete. [View workflow logs]($RUN_URL)."
+            fi
+            echo "EOF_COMMENT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post PR Comment
+        if: ${{ always() && steps.comment.outputs.body != '' }}
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: netlify-deploy-${{ inputs.deployment-name }}
+          message: ${{ steps.comment.outputs.body }}
