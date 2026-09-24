@@ -413,6 +413,23 @@ The workflow checks `publish-dir` after the build. Make sure it matches your fra
 | Nuxt (generate)       | `.output/public`   |
 | Hugo / Jekyll         | `public` / `_site` |
 
+### Next.js
+
+A standard Next.js app with SSR, API routes, middleware or ISR needs Netlify's Next.js adapter, which only runs when the Netlify CLI does the build:
+
+```yaml
+    with:
+      netlify-build: "true"
+      publish-dir: ".next"
+```
+
+For a fully static site (`output: 'export'` in `next.config.js`), let the workflow build it and deploy the export folder:
+
+```yaml
+    with:
+      publish-dir: "out"
+```
+
 ### Plain Static Sites
 
 If there is no `package.json` in `working-directory`, the install and build steps are skipped and `publish-dir` is deployed as-is. Use `publish-dir: "."` to deploy the repository root.

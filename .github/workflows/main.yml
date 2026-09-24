@@ -220,6 +220,10 @@ jobs:
       group: netlify-deploy-${{ inputs.deployment-name }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
 
+    env:
+      # Never block on corepack's "download pnpm/yarn?" confirmation in CI.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
     defaults:
       run:
         shell: bash
@@ -444,6 +448,9 @@ jobs:
         with:
           node-version: ${{ steps.config.outputs.node-version }}
           node-version-file: ${{ steps.config.outputs.node-version-file }}
+          # setup-node v5 auto-enables caching from the packageManager field, which
+          # calls pnpm/yarn before they are installed. Caching is handled below.
+          package-manager-cache: false
 
       - name: Detect Package Manager & Commands
         id: pm
