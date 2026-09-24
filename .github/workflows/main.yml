@@ -27,7 +27,22 @@ on:
 
       # ── Where to deploy ─────────────────────────────────────────────────────
       site-id:
-        description: "Netlify site ID or name. Used when the NETLIFY_SITE_ID secret is not provided"
+        description: "Netlify site ID. Used when the NETLIFY_SITE_ID secret is not provided"
+        required: false
+        default: ""
+        type: string
+      site-name:
+        description: "Site name (<name>.netlify.app) to look up, or create, when no site ID is given. Defaults to <owner>-<repo>"
+        required: false
+        default: ""
+        type: string
+      create-site:
+        description: "Create the site on Netlify if no site ID is given and no site with site-name exists"
+        required: false
+        default: "true"
+        type: string
+      team-slug:
+        description: "Netlify team slug to create the site in (defaults to the token owner's default team)"
         required: false
         default: ""
         type: string
@@ -150,7 +165,7 @@ on:
         description: "Netlify personal access token"
         required: false
       NETLIFY_SITE_ID:
-        description: "Netlify site ID (API ID from Site configuration → General)"
+        description: "Netlify site ID (API ID from Site configuration → General). Optional when the site is resolved by name"
         required: false
       BUILD_ENV:
         description: "Secret build-time environment variables, one KEY=VALUE per line (values are masked in logs)"
@@ -178,6 +193,15 @@ on:
       alias:
         description: "Alias used for the preview deploy (empty for production)"
         value: ${{ jobs.deploy.outputs.alias }}
+      site-id:
+        description: "ID of the Netlify site that was deployed to"
+        value: ${{ jobs.deploy.outputs.site-id }}
+      site-name:
+        description: "Name of the Netlify site that was deployed to"
+        value: ${{ jobs.deploy.outputs.site-name }}
+      site-created:
+        description: "'true' if the site was created by this run"
+        value: ${{ jobs.deploy.outputs.site-created }}
 
 jobs:
   deploy:
@@ -209,6 +233,9 @@ jobs:
       logs-url: ${{ steps.deploy.outputs.logs-url }}
       production: ${{ steps.config.outputs.production }}
       alias: ${{ steps.config.outputs.alias }}
+      site-id: ${{ steps.site.outputs.id }}
+      site-name: ${{ steps.site.outputs.name }}
+      site-created: ${{ steps.site.outputs.created }}
 
     steps:
       - name: Checkout
@@ -221,7 +248,6 @@ jobs:
         id: config
         env:
           HAS_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN != '' }}
-          HAS_SITE_ID: ${{ secrets.NETLIFY_SITE_ID != '' || inputs.site-id != '' }}
           IS_FORK: ${{ github.event.pull_request.head.repo.fork == true }}
           INPUT_PRODUCTION: ${{ inputs.production }}
           INPUT_PRODUCTION_BRANCH: ${{ inputs.production-branch }}
@@ -238,9 +264,8 @@ jobs:
           set -euo pipefail
 
           # ── Credentials ──────────────────────────────────────────────────
-          if [ "$HAS_TOKEN" != "true" ] || [ "$HAS_SITE_ID" != "true" ]; then
-            [ "$HAS_TOKEN" != "true" ] && echo "::error title=Missing NETLIFY_AUTH_TOKEN::Pass the NETLIFY_AUTH_TOKEN secret to this workflow (see README)."
-            [ "$HAS_SITE_ID" != "true" ] && echo "::error title=Missing site ID::Pass the NETLIFY_SITE_ID secret or the site-id input."
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::error title=Missing NETLIFY_AUTH_TOKEN::Pass the NETLIFY_AUTH_TOKEN secret to this workflow (see README)."
             if [ "$IS_FORK" = "true" ]; then
               echo "::error::This pull request comes from a fork, so repository secrets are not available to it."
             fi
@@ -325,6 +350,94 @@ jobs:
           echo "Alias:        ${ALIAS:-<none>}"
           echo "Message:      $MESSAGE"
           echo "Node version: ${NODE_VERSION:-from $NODE_VERSION_FILE}"
+
+      - name: Resolve Netlify Site
+        id: site
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          SITE_ID: ${{ secrets.NETLIFY_SITE_ID || inputs.site-id }}
+          INPUT_SITE_NAME: ${{ inputs.site-name }}
+          CREATE_SITE: ${{ inputs.create-site }}
+          TEAM_SLUG: ${{ inputs.team-slug }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.netlify.com/api/v1"
+          BODY="$RUNNER_TEMP/netlify-site.json"
+
+          # api METHOD PATH [JSON] -> prints the HTTP status, response body goes to $BODY
+          api() {
+            curl -sS -o "$BODY" -w '%{http_code}' -X "$1" "$API$2" \
+              -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+              -H "Content-Type: application/json" \
+              ${3:+--data "$3"}
+          }
+
+          emit() {
+            {
+              echo "id=$(jq -r .id "$BODY")"
+              echo "name=$(jq -r .name "$BODY")"
+              echo "url=$(jq -r '.ssl_url // .url' "$BODY")"
+              echo "admin-url=$(jq -r .admin_url "$BODY")"
+              echo "created=$1"
+            } >> "$GITHUB_OUTPUT"
+            echo "Site: $(jq -r .name "$BODY") ($(jq -r .id "$BODY"))"
+          }
+
+          # ── Explicit site ID ─────────────────────────────────────────────
+          if [ -n "$SITE_ID" ]; then
+            STATUS="$(api GET "/sites/$SITE_ID")"
+            if [ "$STATUS" = "200" ]; then
+              emit false
+              exit 0
+            fi
+            echo "::error title=Site not found::No Netlify site with ID '$SITE_ID' is accessible with this token (HTTP $STATUS). Check NETLIFY_SITE_ID, or remove it to resolve the site by name."
+            exit 1
+          fi
+
+          # ── Resolve by name ──────────────────────────────────────────────
+          NAME="${INPUT_SITE_NAME:-$REPO_OWNER-$REPO_NAME}"
+          NAME="$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-63 | sed -E 's/-+$//')"
+
+          STATUS="$(api GET "/sites/$NAME.netlify.app")"
+          if [ "$STATUS" = "200" ]; then
+            emit false
+            exit 0
+          fi
+
+          if [ "$CREATE_SITE" != "true" ]; then
+            echo "::error title=Site not found::No site named '$NAME' was found and create-site is 'false'. Pass NETLIFY_SITE_ID, set site-name, or enable create-site."
+            exit 1
+          fi
+
+          echo "No site named '$NAME' found, creating it..."
+          if [ -n "$TEAM_SLUG" ]; then
+            CREATE_PATH="/$TEAM_SLUG/sites"
+          else
+            CREATE_PATH="/sites"
+          fi
+          STATUS="$(api POST "$CREATE_PATH" "$(jq -nc --arg name "$NAME" '{name: $name}')")"
+
+          if [ "$STATUS" = "201" ] || [ "$STATUS" = "200" ]; then
+            emit true
+            echo "::notice title=Created Netlify site::Created '$NAME'. Save $(jq -r .id "$BODY") as the NETLIFY_SITE_ID secret to pin this site."
+            exit 0
+          fi
+
+          # A concurrent run may have created it a moment ago.
+          cp "$BODY" "$BODY.create"
+          if [ "$(api GET "/sites/$NAME.netlify.app")" = "200" ]; then
+            emit false
+            exit 0
+          fi
+
+          echo "::error title=Could not create site::Creating '$NAME' failed (HTTP $STATUS): $(jq -c '.errors // .message // .' "$BODY.create" 2>/dev/null || cat "$BODY.create")"
+          if [ "$STATUS" = "422" ]; then
+            echo "::error::Site names are globally unique on Netlify, so '$NAME' is probably taken by someone else. Set the site-name input to something unique."
+          fi
+          exit 1
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -573,7 +686,7 @@ jobs:
         id: deploy
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          SITE_ID: ${{ secrets.NETLIFY_SITE_ID || inputs.site-id }}
+          SITE_ID: ${{ steps.site.outputs.id }}
           PUBLISH_DIR: ${{ inputs.publish-dir }}
           FUNCTIONS_DIR: ${{ inputs.functions-dir }}
           NETLIFY_BUILD: ${{ inputs.netlify-build }}

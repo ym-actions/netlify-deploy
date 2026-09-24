@@ -16,6 +16,7 @@
 
 ## ✨ Features
 
+- 🪄 **No Netlify Setup Needed:** If the site doesn't exist yet, it is created on the first run. You only need a token.
 - 🚀 **Preview & Production in One Workflow:** Pull Requests get a preview deploy at a stable `pr-<number>--<site>.netlify.app` URL. Pushes to your production branch go live. You can override either behaviour.
 - 💬 **Sticky PR Comments:** The preview URL, permalink and deploy log are posted on the PR, and the same comment is updated on every push. If a deploy fails, the comment says so.
 - 📦 **Zero-Config Builds:** Detects npm, pnpm, yarn (classic & berry) or bun from your `packageManager` field or lockfile, installs dependencies, and runs your `build` script.
@@ -35,8 +36,15 @@
 graph TD
     A[Trigger: PR / Push] --> B[Checkout Repo]
     B --> C[Resolve Config<br/>production? alias? message?]
-    C -->|Missing secrets| X[Fail with clear error]
-    C --> D[Setup Node & Package Manager]
+    C -->|Missing token| X[Fail with clear error]
+    C --> S{Site ID given?}
+    S -->|Yes| S1[Verify site exists]
+    S -->|No| S2{Site named site-name exists?}
+    S2 -->|Yes| S3[Use it]
+    S2 -->|No| S4[Create site on Netlify]
+    S1 --> D[Setup Node & Package Manager]
+    S3 --> D
+    S4 --> D
     D --> E{artifact-name set?}
     E -->|Yes| F[Download Artifact into publish-dir]
     E -->|No| G[Cache & Install Dependencies]
@@ -60,14 +68,11 @@ graph TD
 
 ## ⚡ Quick Start
 
-### 1. Add your Netlify credentials as repository secrets
+### 1. Add your Netlify token as a repository secret
 
-| Secret               | Where to find it                                                                                   |
-| :------------------- | :------------------------------------------------------------------------------------------------- |
-| `NETLIFY_AUTH_TOKEN` | Netlify → **User settings → Applications → Personal access tokens → New access token**             |
-| `NETLIFY_SITE_ID`    | Netlify → your site → **Site configuration → General → Site details → Site ID** (a.k.a. _API ID_) |
+Create a token in Netlify under **User settings → Applications → Personal access tokens → New access token**. Save it in your GitHub repository as `NETLIFY_AUTH_TOKEN` under **Settings → Secrets and variables → Actions**.
 
-Add them under **Settings → Secrets and variables → Actions** in your GitHub repository.
+**That's all you need, even if the site doesn't exist on Netlify yet.** See [Site Resolution](#-site-resolution) for how the site is found or created.
 
 ### 2. Call the workflow
 
@@ -90,16 +95,35 @@ jobs:
       pull-requests: write # REQUIRED to post and update comments on PRs
     secrets:
       NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
 ```
 
 With these defaults:
 
 - On a **pull request**, the workflow installs dependencies, runs `build`, deploys `dist/` to `https://pr-<number>--<site>.netlify.app` and comments the link on the PR.
 - On a **push to `main`**, it deploys `dist/` to production.
+- On the **first run**, it creates a Netlify site called `<owner>-<repo>` (for example `https://ym-actions-my-app.netlify.app`) if one doesn't exist yet.
 
 > [!TIP]
 > Instead of listing secrets you can use `secrets: inherit`.
+
+---
+
+## 🪄 Site Resolution
+
+Before building, the workflow works out which Netlify site to deploy to:
+
+1. **A site ID is given** (the `NETLIFY_SITE_ID` secret or the `site-id` input): it checks that the site exists and that your token can access it.
+2. **Otherwise, it looks the site up by name**: `site-name`, or `<owner>-<repo>` by default. It uses the site if it finds one.
+3. **If there's no site with that name** and `create-site` is `"true"` (the default), it creates one, in your `team-slug` team if you set it.
+
+Because the name is deterministic, later runs find the same site again. You don't *have* to save its ID, but pinning it with `NETLIFY_SITE_ID` protects you against renames. The ID is printed in a notice when the site is created, and is also available as the `site-id` output.
+
+> [!NOTE]
+> Site names are **globally unique across all of Netlify**. If the default name is taken by someone else, the run fails with a clear error. Set `site-name` to something unique.
+
+A created site is not linked to your Git repository, so Netlify never builds it on its own. All builds and deploys go through this workflow.
+
+To turn off automatic creation (for example, to prevent a typo in `site-name` from creating a stray site), set `create-site: "false"`.
 
 ---
 
@@ -122,7 +146,10 @@ All inputs are optional. Boolean-like inputs take the strings `"true"` / `"false
 
 | Input               | Description                                                                                                                              | Default                  |
 | :------------------ | :--------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- |
-| `site-id`           | Netlify site ID or name. Used only when the `NETLIFY_SITE_ID` secret is not provided.                                                    | `""`                     |
+| `site-id`           | Netlify site ID. Used only when the `NETLIFY_SITE_ID` secret is not provided.                                                            | `""`                     |
+| `site-name`         | Site name (`<name>.netlify.app`) to look up, or create, when no site ID is given. It is slugified automatically.                         | `<owner>-<repo>`         |
+| `create-site`       | Create the site if no site ID is given and no site with `site-name` exists.                                                             | `"true"`                 |
+| `team-slug`         | Netlify team to create the site in. The slug is in your team URL: `app.netlify.com/teams/<slug>`.                                       | token's default team     |
 | `production`        | `"auto"` deploys to production on pushes to `production-branch` and creates previews otherwise. `"true"` / `"false"` force one or the other. | `"auto"`                 |
 | `production-branch` | Branch that counts as production when `production` is `"auto"`.                                                                         | repository default branch |
 | `alias`             | Alias for preview deploys. `"auto"` uses `pr-<number>` on PRs and the slugified branch name otherwise. `"none"` gives a unique draft URL on every deploy. Any other value is used as the alias. | `"auto"`                 |
@@ -170,10 +197,10 @@ All inputs are optional. Boolean-like inputs take the strings `"true"` / `"false
 | Secret               | Required | Description                                                                                          |
 | :------------------- | :------- | :--------------------------------------------------------------------------------------------------- |
 | `NETLIFY_AUTH_TOKEN` | Yes\*    | Netlify personal access token.                                                                       |
-| `NETLIFY_SITE_ID`    | Yes\*    | Netlify site ID. Alternatively, pass the `site-id` input.                                            |
+| `NETLIFY_SITE_ID`    | No       | Netlify site ID. If omitted, the site is [resolved by name](#-site-resolution), and created if needed. |
 | `BUILD_ENV`          | No       | **Secret** build-time env vars, one `KEY=VALUE` per line. Every value is masked in the logs.         |
 
-\* The workflow declares these as optional so that you can provide them through a GitHub `environment` instead. If they are missing at runtime, the job fails early with a clear error.
+\* It is declared optional so that you can provide it through a GitHub `environment` instead. If it is missing at runtime, the job fails early with a clear error.
 
 ### Outputs
 
@@ -186,6 +213,9 @@ All inputs are optional. Boolean-like inputs take the strings `"true"` / `"false
 | `logs-url`   | Link to the deploy in the Netlify UI.                                                    |
 | `production` | `"true"` if this was a production deploy.                                                |
 | `alias`      | Alias used for the preview deploy (empty for production).                                |
+| `site-id`    | ID of the Netlify site that was deployed to.                                             |
+| `site-name`  | Name of the Netlify site that was deployed to.                                           |
+| `site-created` | `"true"` if this run created the site.                                                 |
 
 ---
 
@@ -211,6 +241,7 @@ jobs:
     secrets:
       NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
       NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }} # optional: pin an existing site
       BUILD_ENV: |
         SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
         STRIPE_PUBLIC_KEY=${{ secrets.STRIPE_PUBLIC_KEY }}
@@ -295,10 +326,10 @@ jobs:
       pull-requests: write
     with:
       deployment-name: Web
+      site-name: acme-web
       working-directory: apps/web
     secrets:
       NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_WEB_SITE_ID }}
 
   deploy-docs:
     uses: ym-actions/netlify-deploy/.github/workflows/main.yml@1.x
@@ -307,14 +338,14 @@ jobs:
       pull-requests: write
     with:
       deployment-name: Docs
+      site-name: acme-docs
       working-directory: apps/docs
       publish-dir: .vitepress/dist
     secrets:
       NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_DOCS_SITE_ID }}
 ```
 
-Each site gets its own PR comment, and the two deploys don't cancel each other.
+Each site is created on first run, gets its own PR comment, and the two deploys don't cancel each other. In a monorepo you need to set `site-name`, because the default `<owner>-<repo>` would be the same for both sites.
 
 ### Let Netlify build (netlify.toml & build plugins)
 
