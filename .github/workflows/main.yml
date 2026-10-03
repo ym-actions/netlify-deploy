@@ -111,9 +111,14 @@ on:
 
       # ── Netlify CLI ─────────────────────────────────────────────────────────
       netlify-cli-version:
-        description: "Version of netlify-cli to install"
+        description: "Version of netlify-cli to install globally (ignored when a local netlify-cli is used)"
         required: false
         default: "latest"
+        type: string
+      use-local-cli:
+        description: "Use the netlify-cli from the project's own dependencies (node_modules/.bin) instead of installing it globally. Falls back to a global install, with a warning, if it is not found"
+        required: false
+        default: "false"
         type: string
       filter:
         description: "Monorepo package to deploy (passed to netlify deploy --filter)"
@@ -682,11 +687,52 @@ jobs:
           fi
           echo "Deploying $(find "$PUBLISH_DIR" -type f | wc -l | tr -d ' ') files from $PUBLISH_DIR"
 
-      - name: Install Netlify CLI
+      - name: Set Up Netlify CLI
+        id: cli
         env:
           CLI_VERSION: ${{ inputs.netlify-cli-version }}
+          USE_LOCAL: ${{ inputs.use-local-cli }}
+          PM: ${{ steps.pm.outputs.name }}
         run: |
-          npm install -g "netlify-cli@$CLI_VERSION" --no-fund --no-audit
+          set -euo pipefail
+
+          # Look for a locally installed CLI, walking up to the repo root so that
+          # hoisted monorepo dependencies are found too.
+          LOCAL_BIN=""
+          if [ "$USE_LOCAL" = "true" ]; then
+            DIR="$PWD"
+            while :; do
+              if [ -x "$DIR/node_modules/.bin/netlify" ]; then
+                LOCAL_BIN="$DIR/node_modules/.bin"
+                break
+              fi
+              { [ "$DIR" = "$GITHUB_WORKSPACE" ] || [ "$DIR" = "/" ]; } && break
+              DIR="$(dirname "$DIR")"
+            done
+          fi
+
+          if [ -n "$LOCAL_BIN" ]; then
+            echo "$LOCAL_BIN" >> "$GITHUB_PATH"
+            export PATH="$LOCAL_BIN:$PATH"
+            echo "source=local" >> "$GITHUB_OUTPUT"
+            echo "Using local netlify-cli from $LOCAL_BIN"
+            [ "$CLI_VERSION" != "latest" ] && echo "::notice::netlify-cli-version is ignored because the local netlify-cli is used."
+          else
+            if [ "$USE_LOCAL" = "true" ]; then
+              case "$PM" in
+                pnpm) ADD="pnpm add -D netlify-cli" ;;
+                yarn) ADD="yarn add -D netlify-cli" ;;
+                bun)  ADD="bun add -d netlify-cli" ;;
+                *)    ADD="npm install --save-dev netlify-cli" ;;
+              esac
+              echo "source=global-fallback" >> "$GITHUB_OUTPUT"
+              echo "install-hint=$ADD" >> "$GITHUB_OUTPUT"
+              echo "::warning title=netlify-cli not found locally::use-local-cli is enabled but netlify-cli is not in node_modules/.bin, so it is being installed globally (slower). Add it to your project: $ADD"
+            else
+              echo "source=global" >> "$GITHUB_OUTPUT"
+            fi
+            npm install -g "netlify-cli@$CLI_VERSION" --no-fund --no-audit
+          fi
           netlify --version
 
       - name: Deploy
@@ -786,6 +832,23 @@ jobs:
             [ -n "$PERMALINK" ] && echo "| **Permalink** | $PERMALINK |"
             [ -n "$LOGS_URL" ] && echo "| **Deploy log** | $LOGS_URL |"
             echo "| **Commit** | \`${SHA:0:7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report Netlify CLI Fallback
+        if: ${{ always() && steps.cli.outputs.source == 'global-fallback' }}
+        env:
+          HINT: ${{ steps.cli.outputs.install-hint }}
+        run: |
+          echo "::warning title=netlify-cli was installed globally::use-local-cli is enabled but netlify-cli was not found in the project's dependencies, so it was installed on every run. Install it locally to speed up deploys: $HINT"
+          {
+            echo ""
+            echo "> [!WARNING]"
+            echo "> \`use-local-cli\` is enabled but \`netlify-cli\` was not found in your project's dependencies, so it was installed globally on this run (slower)."
+            echo "> Install it locally and commit the updated lockfile:"
+            echo ">"
+            echo "> \`\`\`sh"
+            echo "> $HINT"
+            echo "> \`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prepare PR Comment

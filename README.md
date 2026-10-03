@@ -21,7 +21,7 @@
 - 💬 **Sticky PR Comments:** The preview URL, permalink and deploy log are posted on the PR, and the same comment is updated on every push. If a deploy fails, the comment says so.
 - 📦 **Zero-Config Builds:** Detects npm, pnpm, yarn (classic & berry) or bun from your `packageManager` field or lockfile, installs dependencies, and runs your `build` script.
 - 🟢 **Node Version Detection:** Reads `.nvmrc` / `.node-version` and falls back to the latest LTS.
-- ⚙️ **Smart Caching:** Caches package manager downloads between runs.
+- ⚙️ **Smart Caching:** Caches package manager downloads between runs. Optionally uses your project's own `netlify-cli` to skip the global install.
 - 🏗️ **Bring Your Own Build:** Deploy an artifact built by an earlier job, or let the Netlify CLI run the build with `netlify.toml` and build plugins.
 - 🗂️ **Monorepo Friendly:** Supports `working-directory` and `filter`, and can deploy several sites from one PR without their comments overwriting each other.
 - 🔐 **Secret Build Variables:** Pass build-time env vars through a single `BUILD_ENV` secret. Its values are masked in the logs.
@@ -172,7 +172,8 @@ All inputs are optional. Boolean-like inputs take the strings `"true"` / `"false
 
 | Input                 | Description                                                              | Default    |
 | :-------------------- | :----------------------------------------------------------------------- | :--------- |
-| `netlify-cli-version` | Version of [`netlify-cli`](https://www.npmjs.com/package/netlify-cli) to install. | `"latest"` |
+| `netlify-cli-version` | Version of [`netlify-cli`](https://www.npmjs.com/package/netlify-cli) to install globally. Ignored when a local CLI is used. | `"latest"` |
+| `use-local-cli`       | Use `netlify-cli` from your project's dependencies instead of installing it globally (see [Faster deploys](#-faster-deploys-with-a-local-netlify-cli)). | `"false"`  |
 | `filter`              | Monorepo package to deploy (`netlify deploy --filter`).                  | `""`       |
 | `deploy-args`         | Extra arguments appended to `netlify deploy`.                            | `""`       |
 
@@ -433,6 +434,24 @@ For a fully static site (`output: 'export'` in `next.config.js`), let the workfl
 ### Plain Static Sites
 
 If there is no `package.json` in `working-directory`, the install and build steps are skipped and `publish-dir` is deployed as-is. Use `publish-dir: "."` to deploy the repository root.
+
+### ⚡ Faster deploys with a local Netlify CLI
+
+By default the workflow runs `npm install -g netlify-cli` on every run, which is slow and isn't covered by the dependency cache. If you add `netlify-cli` to your project's `devDependencies`, it's installed (and cached) together with the rest of your dependencies, and the workflow can use it directly:
+
+```sh
+npm install --save-dev netlify-cli   # or: pnpm add -D / yarn add -D / bun add -d
+```
+
+```yaml
+with:
+  use-local-cli: "true"
+```
+
+- The CLI version is whatever your lockfile pins; `netlify-cli-version` is ignored.
+- The CLI is looked up in `node_modules/.bin`, walking up to the repository root (so hoisted monorepo installs work).
+- It requires dependencies to be installed. It won't be found if `install-command` is `none`, or when deploying a pre-built `artifact-name` (which skips the install).
+- **Safe fallback:** if the local CLI isn't found, the workflow installs it globally as before, and ends the run with a warning annotation and a job-summary note including the command to add it to your project.
 
 ### Disable Netlify's Own Builds
 
