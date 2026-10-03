@@ -36,6 +36,16 @@ on:
         required: false
         default: ""
         type: string
+      site-name-prefix:
+        description: "Text added before the resolved site name (e.g. 'staging-'). Only used when resolving by name"
+        required: false
+        default: ""
+        type: string
+      site-name-suffix:
+        description: "Text added after the resolved site name (e.g. '-staging'). Only used when resolving by name"
+        required: false
+        default: ""
+        type: string
       create-site:
         description: "Create the site on Netlify if no site ID is given and no site with site-name exists"
         required: false
@@ -366,6 +376,8 @@ jobs:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           SITE_ID: ${{ secrets.NETLIFY_SITE_ID || inputs.site-id }}
           INPUT_SITE_NAME: ${{ inputs.site-name }}
+          NAME_PREFIX: ${{ inputs.site-name-prefix }}
+          NAME_SUFFIX: ${{ inputs.site-name-suffix }}
           CREATE_SITE: ${{ inputs.create-site }}
           TEAM_SLUG: ${{ inputs.team-slug }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -407,8 +419,21 @@ jobs:
           fi
 
           # ── Resolve by name ──────────────────────────────────────────────
-          NAME="${INPUT_SITE_NAME:-$REPO_OWNER-$REPO_NAME}"
-          NAME="$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-63 | sed -E 's/-+$//')"
+          # Site names are DNS labels: lowercase, [a-z0-9-], at most 63 characters.
+          slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+          BASE="$(slug "${INPUT_SITE_NAME:-$REPO_OWNER-$REPO_NAME}")"
+          PREFIX="$(slug "$NAME_PREFIX")"
+          SUFFIX="$(slug "$NAME_SUFFIX")"
+          [ -n "$PREFIX" ] && PREFIX="$PREFIX-"
+          [ -n "$SUFFIX" ] && SUFFIX="-$SUFFIX"
+          # Trim the base (not the prefix/suffix) so the whole name fits.
+          MAX_BASE=$((63 - ${#PREFIX} - ${#SUFFIX}))
+          if [ "$MAX_BASE" -lt 1 ]; then
+            echo "::error title=Site name too long::site-name-prefix and site-name-suffix leave no room for a site name (63 characters max)."
+            exit 1
+          fi
+          BASE="$(echo "$BASE" | cut -c1-"$MAX_BASE" | sed -E 's/-+$//')"
+          NAME="$PREFIX$BASE$SUFFIX"
 
           STATUS="$(api GET "/sites/$NAME.netlify.app")"
           if [ "$STATUS" = "200" ]; then

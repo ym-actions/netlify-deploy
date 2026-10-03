@@ -113,7 +113,7 @@ With these defaults:
 Before building, the workflow works out which Netlify site to deploy to:
 
 1. **A site ID is given** (the `NETLIFY_SITE_ID` secret or the `site-id` input): it checks that the site exists and that your token can access it.
-2. **Otherwise, it looks the site up by name**: `site-name`, or `<owner>-<repo>` by default. It uses the site if it finds one.
+2. **Otherwise, it looks the site up by name**: `site-name`, or `<owner>-<repo>` by default, wrapped in `site-name-prefix` / `site-name-suffix` if set. It uses the site if it finds one.
 3. **If there's no site with that name** and `create-site` is `"true"` (the default), it creates one, in your `team-slug` team if you set it.
 
 Because the name is deterministic, later runs find the same site again. You don't *have* to save its ID, but pinning it with `NETLIFY_SITE_ID` protects you against renames. The ID is printed in a notice when the site is created, and is also available as the `site-id` output.
@@ -122,6 +122,17 @@ Because the name is deterministic, later runs find the same site again. You don'
 > Site names are **globally unique across all of Netlify**. If the default name is taken by someone else, the run fails with a clear error. Set `site-name` to something unique.
 
 A created site is not linked to your Git repository, so Netlify never builds it on its own. All builds and deploys go through this workflow.
+
+### Staging and other variants
+
+Use `site-name-prefix` / `site-name-suffix` to derive a related site from the same auto-resolved name, without hard-coding it:
+
+```yaml
+with:
+  site-name-suffix: "-staging"   # acme-web  →  acme-web-staging
+```
+
+They wrap whatever name is resolved (`site-name` or the `<owner>-<repo>` default), are lower-cased and cleaned for DNS, and are ignored when a site ID is given. If the result would exceed Netlify's 63-character limit, the base name is trimmed, never the prefix or suffix.
 
 To turn off automatic creation (for example, to prevent a typo in `site-name` from creating a stray site), set `create-site: "false"`.
 
@@ -148,6 +159,8 @@ All inputs are optional. Boolean-like inputs take the strings `"true"` / `"false
 | :------------------ | :--------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- |
 | `site-id`           | Netlify site ID. Used only when the `NETLIFY_SITE_ID` secret is not provided.                                                            | `""`                     |
 | `site-name`         | Site name (`<name>.netlify.app`) to look up, or create, when no site ID is given. It is slugified automatically.                         | `<owner>-<repo>`         |
+| `site-name-prefix` | Text added before the resolved site name, e.g. `staging-`. Only used when resolving by name. | `""` |
+| `site-name-suffix` | Text added after the resolved site name, e.g. `-staging`. Only used when resolving by name. | `""` |
 | `create-site`       | Create the site if no site ID is given and no site with `site-name` exists.                                                             | `"true"`                 |
 | `team-slug`         | Netlify team to create the site in. The slug is in your team URL: `app.netlify.com/teams/<slug>`.                                       | token's default team     |
 | `production`        | `"auto"` deploys to production on pushes to `production-branch` and creates previews otherwise. `"true"` / `"false"` force one or the other. | `"auto"`                 |
